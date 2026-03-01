@@ -1,6 +1,6 @@
 {
   "name": "@ex-machina/opencode-anthropic-auth",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "main": "./index.mjs",
   "scripts": {
     "bump": "bun script/bump.ts"

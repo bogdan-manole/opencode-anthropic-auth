@@ -1,4 +1,11 @@
-import { REQUIRED_BETAS, TOOL_PREFIX, USER_AGENT } from './constants'
+import {
+  CLAUDE_CODE_IDENTITY,
+  OPENCODE_IDENTITY,
+  PRESERVED_TAIL_MARKERS,
+  REQUIRED_BETAS,
+  TOOL_PREFIX,
+  USER_AGENT,
+} from './constants'
 
 export type FetchInput = string | URL | Request
 
@@ -203,6 +210,159 @@ export function rewriteUrl(input: FetchInput): {
       ? new Request(requestUrl.toString(), input)
       : requestUrl
   return { input: newInput, url: requestUrl }
+}
+
+/**
+ * Remove the OpenCode identity section from system prompt text.
+ * Finds the OpenCode identity marker, then removes everything up to
+ * the earliest preserved tail marker (user instructions, code references, etc.).
+ * This preserves user-configured instructions from config.json.
+ */
+export function sanitizeSystemText(
+  text: string,
+  onError?: (msg: string) => void,
+): string {
+  const startIdx = text.indexOf(OPENCODE_IDENTITY)
+  if (startIdx === -1) return text
+
+  // Find the earliest preserved tail marker after the OpenCode identity
+  let endIdx = -1
+  for (const marker of PRESERVED_TAIL_MARKERS) {
+    const idx = text.indexOf(marker, startIdx)
+    if (idx !== -1 && (endIdx === -1 || idx < endIdx)) {
+      endIdx = idx
+    }
+  }
+
+  if (endIdx === -1) {
+    onError?.(
+      'sanitizeSystemText: could not find any preserved tail marker after OpenCode identity',
+    )
+    return text
+  }
+
+  // Preserve content from the marker onwards (skip leading newline if present)
+  const tail =
+    text[endIdx] === '\n' ? text.slice(endIdx + 1) : text.slice(endIdx)
+  return text.slice(0, startIdx) + tail
+}
+
+type SystemBlock = { type: string; text: string; [k: string]: unknown }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * Sanitize system prompt and prepend Claude Code identity.
+ * Handles all Anthropic API system formats: undefined, string, or array of text blocks.
+ */
+export function prependClaudeCodeIdentity(
+  system: unknown,
+  onError?: (msg: string) => void,
+): SystemBlock[] {
+  const identityBlock: SystemBlock = {
+    type: 'text',
+    text: CLAUDE_CODE_IDENTITY,
+  }
+
+  if (system == null) return [identityBlock]
+
+  if (typeof system === 'string') {
+    const sanitized = sanitizeSystemText(system, onError)
+    if (sanitized === CLAUDE_CODE_IDENTITY) return [identityBlock]
+    return [identityBlock, { type: 'text', text: sanitized }]
+  }
+
+  if (isRecord(system)) {
+    const type = typeof system.type === 'string' ? system.type : 'text'
+    const text = typeof system.text === 'string' ? system.text : ''
+    return [
+      identityBlock,
+      { ...system, type, text: sanitizeSystemText(text, onError) },
+    ]
+  }
+
+  if (!Array.isArray(system)) return [identityBlock]
+
+  const sanitized: SystemBlock[] = system.map((item: unknown) => {
+    if (typeof item === 'string') {
+      return { type: 'text', text: sanitizeSystemText(item, onError) }
+    }
+
+    if (
+      isRecord(item) &&
+      item.type === 'text' &&
+      typeof item.text === 'string'
+    ) {
+      return {
+        ...item,
+        type: 'text',
+        text: sanitizeSystemText(item.text, onError),
+      }
+    }
+
+    return { type: 'text', text: String(item) }
+  })
+
+  // Idempotency: don't double-prepend if first block already has the identity
+  if (sanitized[0]?.text === CLAUDE_CODE_IDENTITY) {
+    return sanitized
+  }
+
+  return [identityBlock, ...sanitized]
+}
+
+/**
+ * Rewrite the full request body: sanitize system prompt and prefix tool names.
+ */
+export function rewriteRequestBody(
+  body: string,
+  onError?: (msg: string) => void,
+): string {
+  try {
+    const parsed = JSON.parse(body)
+
+    // Sanitize system prompt and prepend Claude Code identity
+    parsed.system = prependClaudeCodeIdentity(parsed.system, onError)
+
+    // Prefix tool names
+    if (parsed.tools && Array.isArray(parsed.tools)) {
+      parsed.tools = parsed.tools.map(
+        (tool: { name?: string; [k: string]: unknown }) => ({
+          ...tool,
+          name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
+        }),
+      )
+    }
+
+    if (parsed.messages && Array.isArray(parsed.messages)) {
+      parsed.messages = parsed.messages.map(
+        (msg: {
+          content?: Array<{
+            type: string
+            name?: string
+            [k: string]: unknown
+          }>
+          [k: string]: unknown
+        }) => {
+          if (msg.content && Array.isArray(msg.content)) {
+            msg.content = msg.content.map((block) => {
+              if (block.type === 'tool_use' && block.name) {
+                return { ...block, name: `${TOOL_PREFIX}${block.name}` }
+              }
+              return block
+            })
+          }
+          return msg
+        },
+      )
+    }
+
+    return JSON.stringify(parsed)
+  } catch {
+    return body
+  }
 }
 
 /**

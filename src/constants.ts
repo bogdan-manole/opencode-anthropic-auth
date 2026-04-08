@@ -26,4 +26,15 @@ export const REQUIRED_BETAS = [
   'interleaved-thinking-2025-05-14',
 ]
 
+export const OPENCODE_IDENTITY =
+  'You are OpenCode, the best coding agent on the planet.'
+export const CLAUDE_CODE_IDENTITY =
+  "You are Claude Code, Anthropic's official CLI for Claude."
+
 export const USER_AGENT = 'claude-cli/2.1.2 (external, cli)'
+
+export const PRESERVED_TAIL_MARKERS = [
+  '\nInstructions from: ',
+  '\nInstructions from command: ',
+  '# Code References',
+]

@@ -1,12 +1,19 @@
-import { afterEach, describe, expect, test } from 'bun:test'
-import { REQUIRED_BETAS } from '../constants'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
+import {
+  CLAUDE_CODE_IDENTITY,
+  OPENCODE_IDENTITY,
+  REQUIRED_BETAS,
+} from '../constants'
 import {
   createStrippedStream,
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
   prefixToolNames,
+  prependClaudeCodeIdentity,
+  rewriteRequestBody,
   rewriteUrl,
+  sanitizeSystemText,
   setOAuthHeaders,
   stripToolPrefix,
 } from '../transform'
@@ -80,8 +87,9 @@ describe('mergeBetaHeaders', () => {
   })
 
   test('deduplicates betas', () => {
+    const beta = REQUIRED_BETAS[0] ?? ''
     const headers = new Headers({
-      'anthropic-beta': REQUIRED_BETAS[0],
+      'anthropic-beta': beta,
     })
     const result = mergeBetaHeaders(headers)
     const parts = result.split(',')
@@ -450,5 +458,271 @@ describe('createStrippedStream', () => {
     const original = new Response(null, { status: 204 })
     const result = createStrippedStream(original)
     expect(result).toBe(original)
+  })
+})
+
+describe('sanitizeSystemText', () => {
+  // A realistic OpenCode system prompt showing what gets stripped vs preserved.
+  //
+  //   STRIPPED: everything from the identity line down to the first tail marker
+  //   KEPT:    everything before the identity + everything from the tail marker on
+  //
+  //   ┌─────────────────────────────────────────────────────────────┐
+  //   │ You are OpenCode, the best coding agent on the planet.     │ ← STRIPPED
+  //   │                                                            │
+  //   │ OpenCode-specific instructions, tool docs, etc.            │ ← STRIPPED
+  //   │ All of this is removed.                                    │ ← STRIPPED
+  //   │                                                            │
+  //   │ Instructions from: ~/.config/opencode/preamble.md          │ ← KEPT
+  //   │ Be concise. Prefer TypeScript.                             │ ← KEPT
+  //   │                                                            │
+  //   │ # Code References                                          │ ← KEPT
+  //   │ src/index.ts ...                                           │ ← KEPT
+  //   └─────────────────────────────────────────────────────────────┘
+
+  const REALISTIC_PROMPT = [
+    'You are OpenCode, the best coding agent on the planet.',
+    '',
+    'You have access to tools for reading files, running commands,',
+    'and editing code. Always explain before acting.',
+    '',
+    'Instructions from: ~/.config/opencode/preamble.md',
+    'Be concise. Prefer TypeScript.',
+    '',
+    '# Code References',
+    'src/index.ts (1-50)',
+  ].join('\n')
+
+  test('strips OpenCode section, keeps user instructions and code refs', () => {
+    const result = sanitizeSystemText(REALISTIC_PROMPT)
+
+    // Stripped
+    expect(result).not.toContain('OpenCode')
+    expect(result).not.toContain('explain before acting')
+
+    // Kept
+    expect(result).toContain(
+      'Instructions from: ~/.config/opencode/preamble.md',
+    )
+    expect(result).toContain('Be concise. Prefer TypeScript.')
+    expect(result).toContain('# Code References')
+    expect(result).toContain('src/index.ts (1-50)')
+  })
+
+  test('returns text unchanged when OpenCode identity not present', () => {
+    const text = 'Just a normal system prompt'
+    expect(sanitizeSystemText(text)).toBe(text)
+  })
+
+  test('calls onError when no preserved tail marker is found', () => {
+    const onError = mock(() => {})
+    const text = [
+      'You are OpenCode, the best coding agent on the planet.',
+      'No markers at all in this prompt.',
+    ].join('\n')
+    const result = sanitizeSystemText(text, onError)
+    expect(result).toBe(text)
+    expect(onError).toHaveBeenCalledTimes(1)
+  })
+
+  test('preserves content before OpenCode identity', () => {
+    const text = [
+      'Some prefix content',
+      'You are OpenCode, the best coding agent on the planet.',
+      'OpenCode stuff to strip',
+      '# Code References',
+      'file contents',
+    ].join('\n')
+    const result = sanitizeSystemText(text)
+    expect(result).toBe('Some prefix content\n# Code References\nfile contents')
+  })
+
+  test('prefers earliest tail marker (instructions before code refs)', () => {
+    // "Instructions from:" appears before "# Code References",
+    // so we cut there — keeping the user's custom instructions.
+    const text = [
+      'You are OpenCode, the best coding agent on the planet.',
+      'OpenCode internal stuff',
+      'Instructions from: preamble.md',
+      'user-authored content',
+      '# Code References',
+      'files',
+    ].join('\n')
+    const result = sanitizeSystemText(text)
+    expect(result).not.toContain('OpenCode')
+    expect(result).toContain('Instructions from: preamble.md')
+    expect(result).toContain('user-authored content')
+    expect(result).toContain('# Code References')
+  })
+
+  test('preserves instructions from command', () => {
+    const text = [
+      'You are OpenCode, the best coding agent on the planet.',
+      'Internal details',
+      'Instructions from command: my-script',
+      'Script output here',
+      '# Code References',
+    ].join('\n')
+    const result = sanitizeSystemText(text)
+    expect(result).toContain('Instructions from command: my-script')
+    expect(result).toContain('Script output here')
+  })
+
+  test('falls back to # Code References when no instruction markers', () => {
+    const text = [
+      'You are OpenCode, the best coding agent on the planet.',
+      'Stuff to strip',
+      '# Code References',
+      'src/main.ts',
+    ].join('\n')
+    const result = sanitizeSystemText(text)
+    expect(result).toBe('# Code References\nsrc/main.ts')
+  })
+})
+
+describe('prependClaudeCodeIdentity', () => {
+  test('returns identity block for undefined system', () => {
+    const result = prependClaudeCodeIdentity(undefined)
+    expect(result).toEqual([{ type: 'text', text: CLAUDE_CODE_IDENTITY }])
+  })
+
+  test('sanitizes and prepends for string system', () => {
+    const result = prependClaudeCodeIdentity('Some assistant prompt')
+    expect(result).toHaveLength(2)
+    expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result[1]?.text).toBe('Some assistant prompt')
+  })
+
+  test('sanitizes array of text blocks', () => {
+    const system = [
+      {
+        type: 'text',
+        text: `${OPENCODE_IDENTITY}\nstuff\n# Code References\nrest`,
+      },
+      { type: 'text', text: 'other block' },
+    ]
+    const result = prependClaudeCodeIdentity(system)
+    expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result[1]?.text).not.toContain(OPENCODE_IDENTITY)
+    expect(result[1]?.text).toContain('# Code References')
+  })
+
+  test('does not double-prepend if identity already present', () => {
+    const system = [
+      { type: 'text', text: CLAUDE_CODE_IDENTITY },
+      { type: 'text', text: 'other' },
+    ]
+    const result = prependClaudeCodeIdentity(system)
+    expect(result).toHaveLength(2)
+    expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('handles string elements in array', () => {
+    const system = ['some text', 'more text']
+    const result = prependClaudeCodeIdentity(system)
+    expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result[1]).toEqual({ type: 'text', text: 'some text' })
+  })
+})
+
+describe('rewriteRequestBody', () => {
+  test('prefixes tool names and rewrites system prompt', () => {
+    const body = JSON.stringify({
+      tools: [{ name: 'bash', type: 'function' }],
+      messages: [{ role: 'user', content: 'hello world test message' }],
+      system: 'You are a helpful assistant.',
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.tools[0].name).toBe('mcp_bash')
+    expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('handles missing system field', () => {
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.system).toHaveLength(1)
+    expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('returns original string on invalid JSON', () => {
+    const body = 'not valid json'
+    expect(rewriteRequestBody(body)).toBe(body)
+  })
+
+  test('passes onError through to sanitization', () => {
+    const onError = mock(() => {})
+    const body = JSON.stringify({
+      messages: [],
+      system: `${OPENCODE_IDENTITY}\nno code refs marker here`,
+    })
+    rewriteRequestBody(body, onError)
+    expect(onError).toHaveBeenCalledTimes(1)
+  })
+
+  test('rewrites realistic OpenCode request end-to-end', () => {
+    //  Input system prompt (array of blocks):
+    //    [0] "You are OpenCode..." + internal stuff + "# Code References\n..."
+    //    [1] "Additional context block"
+    //
+    //  Expected output:
+    //    [0] Claude Code identity (prepended)
+    //    [1] "# Code References\n..." (OpenCode section stripped)
+    //    [2] "Additional context block" (untouched)
+
+    const systemPrompt = [
+      'You are OpenCode, the best coding agent on the planet.',
+      '',
+      'You have access to tools.',
+      '',
+      '# Code References',
+      '',
+      'Here are some files.',
+    ].join('\n')
+
+    const body = JSON.stringify({
+      tools: [
+        { name: 'bash', type: 'function' },
+        { name: 'read_file', type: 'function' },
+      ],
+      messages: [
+        { role: 'user', content: 'Help me fix this bug' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'bash', id: 'tool_1' },
+            { type: 'text', text: 'Let me check' },
+          ],
+        },
+      ],
+      system: [
+        { type: 'text', text: systemPrompt },
+        { type: 'text', text: 'Additional context block' },
+      ],
+    })
+
+    const result = JSON.parse(rewriteRequestBody(body))
+
+    // System prompt rewritten
+    expect(result.system[0].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(result.system[1].text).toContain('# Code References')
+    expect(result.system[1].text).not.toContain('OpenCode')
+    expect(result.system[2].text).toBe('Additional context block')
+
+    // Tool names prefixed
+    expect(result.tools[0].name).toBe('mcp_bash')
+    expect(result.tools[1].name).toBe('mcp_read_file')
+
+    // tool_use blocks in messages prefixed, text untouched
+    expect(result.messages[1].content[0].name).toBe('mcp_bash')
+    expect(result.messages[1].content[1].text).toBe('Let me check')
+    expect(result.messages[0].content).toBe('Help me fix this bug')
+  })
+
+  test('handles body with no messages array', () => {
+    const body = JSON.stringify({ model: 'claude-3' })
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
   })
 })
